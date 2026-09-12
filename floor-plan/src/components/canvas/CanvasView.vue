@@ -88,7 +88,7 @@ type DragState =
       kind: 'move'
       ids: string[]
       startWorld: Pt
-      origins: { id: string; x: number; y: number; points?: Pt[] }[]
+      origins: { id: string; x: number; y: number; points?: Pt[]; p1?: Pt; p2?: Pt }[]
     }
   | { kind: 'wall-vertex'; wallId: string; index: number; startWorld: Pt }
   | { kind: 'wall-body'; wallId: string; startWorld: Pt; points: Pt[] }
@@ -145,9 +145,11 @@ function onWheel(e: WheelEvent) {
   e.preventDefault()
   const rect = getRect()
   const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12
-  const sx = e.clientX - rect.left
-  const sy = e.clientY - rect.top
-  // zoomAt 期望内容坐标系的屏幕位置；内容已含 ruler 偏移，这里直接用容器内坐标
+  const ruler = state.doc.settings.showRulers ? rulerSize.value : 0
+  // 内容在屏幕上的位置 = tx + rulerSize，zoomAt 操作的是 tx/ty，
+  // 因此锚点要扣除标尺边距，缩放中心才会跟随光标。
+  const sx = e.clientX - rect.left - ruler
+  const sy = e.clientY - rect.top - ruler
   zoomAt(sx, sy, factor)
 }
 
@@ -264,10 +266,12 @@ function handleSelectDown(e: PointerEvent, w: Pt) {
       if (x.kind === 'wall') {
         return { id: x.id, x: 0, y: 0, points: x.points.map((p) => ({ ...p })) }
       }
-      if (x.kind === 'furniture' || x.kind === 'dimension') {
-        const xx = x.kind === 'furniture' ? x.x : (x.p1.x + x.p2.x) / 2
-        const yy = x.kind === 'furniture' ? x.y : (x.p1.y + x.p2.y) / 2
-        return { id: x.id, x: xx, y: yy }
+      if (x.kind === 'furniture') {
+        return { id: x.id, x: x.x, y: x.y }
+      }
+      if (x.kind === 'dimension') {
+        // 保存两个端点的绝对起始位置，拖动时整体平移
+        return { id: x.id, x: 0, y: 0, p1: { ...x.p1 }, p2: { ...x.p2 } }
       }
       return { id: x.id, x: 0, y: 0 }
     })
@@ -512,15 +516,10 @@ function doMove(w: Pt, d: Extract<DragState, { kind: 'move' }>) {
     } else if (el.kind === 'furniture') {
       el.x = o.x + dx
       el.y = o.y + dy
-    } else if (el.kind === 'dimension') {
-      // 标注整体移动
-      const cx = o.x
-      const cy = o.y
-      const ddx = cx + dx - (el.p1.x + el.p2.x) / 2
-      const ddy = cy + dy - (el.p1.y + el.p2.y) / 2
-      void ddx
-      el.p1 = { x: el.p1.x + dx, y: el.p1.y + dy }
-      el.p2 = { x: el.p2.x + dx, y: el.p2.y + dy }
+    } else if (el.kind === 'dimension' && o.p1 && o.p2) {
+      // 从起始绝对位置整体平移，避免每帧增量叠加
+      el.p1 = { x: o.p1.x + dx, y: o.p1.y + dy }
+      el.p2 = { x: o.p2.x + dx, y: o.p2.y + dy }
     }
   }
 }

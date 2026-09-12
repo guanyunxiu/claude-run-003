@@ -1,24 +1,17 @@
 /**
  * 高清 PNG 导出
  *
- * 直接从画布的世界内容组中挑选可见图元（墙/门窗/家具/标注/房间），
- * 深拷贝到全新的独立 SVG，按图纸包围盒设置 viewBox，
- * 绘制到 2D Canvas（支持 2x/3x 超采样）后导出 PNG。
+ * 导出使用独立的离屏渲染器 ExportRenderer，以固定基准比例 EXPORT_SCALE 重新渲染，
+ * 与当前视口缩放/标尺/网格/选中态无关，保证线宽、字体、尺寸恒定。
+ * 流程：动态挂载渲染器 -> 等待渲染 -> 克隆 world-content 按包围盒平移 ->
+ * 序列化 SVG -> Canvas 超采样（2x/3x）-> 导出 PNG。
  * 兜底：html2canvas 截取当前 DOM。
  */
+import { createApp, h, nextTick } from 'vue'
 import html2canvas from 'html2canvas'
 import type { FloorElement } from '@/types'
 import { bboxOf, type Pt } from './geometry'
-
-/** 需要导出的图元 CSS 类（按 DOM 顺序） */
-const EXPORT_SELECTOR = [
-  '.room-face',
-  '.wall-shape',
-  '.door-shape',
-  '.window-shape',
-  '.furniture-shape',
-  '.dimension-shape'
-].join(',')
+import ExportRenderer, { EXPORT_SCALE } from '@/components/ExportRenderer.vue'
 
 /** 计算所有图元覆盖的世界坐标包围盒 */
 export function contentBBox(elements: FloorElement[], pad = 400) {
@@ -42,88 +35,113 @@ export interface ExportOptions {
   background?: string
   /** 世界坐标包围盒 */
   bbox: { x: number; y: number; width: number; height: number }
-  /** 输出基准像素/毫米（导出分辨率，与当前视口缩放无关） */
-  ppm?: number
-  /** 宽高上限（像素），避免超大图纸爆内存 */
+  /** 宽高上限（像素，超采样前），避免超大图纸爆内存 */
   maxPixels?: number
 }
 
-export async function exportPng(svgEl: SVGSVGElement, opts: ExportOptions): Promise<void> {
-  const ratio = opts.pixelRatio ?? 2
-  let ppm = opts.ppm ?? 0.5
-
-  const NS = 'http://www.w3.org/2000/svg'
-  let wPx = Math.round(opts.bbox.width * ppm)
-  let hPx = Math.round(opts.bbox.height * ppm)
-
-  // 按最长边限制基准分辨率（超采样前）
-  const maxSide = (opts.maxPixels ?? 6000)
-  const m = Math.max(wPx, hPx)
-  if (m > maxSide) {
-    ppm *= maxSide / m
-    wPx = Math.round(opts.bbox.width * ppm)
-    hPx = Math.round(opts.bbox.height * ppm)
-  }
-
-  const worldContent = svgEl.querySelector('.world-content')
-  if (!worldContent) throw new Error('未找到画布内容')
-
-  const outSvg = document.createElementNS(NS, 'svg')
-  outSvg.setAttribute('xmlns', NS)
-  outSvg.setAttribute('width', String(wPx))
-  outSvg.setAttribute('height', String(hPx))
-  outSvg.setAttribute('viewBox', `0 0 ${wPx} ${hPx}`)
-
-  // 背景（viewBox 像素坐标）
-  const bg = document.createElementNS(NS, 'rect')
-  bg.setAttribute('x', '0')
-  bg.setAttribute('y', '0')
-  bg.setAttribute('width', String(wPx))
-  bg.setAttribute('height', String(hPx))
-  bg.setAttribute('fill', opts.background ?? '#ffffff')
-  outSvg.appendChild(bg)
-
-  // 世界 -> 输出像素：平移包围盒左上 + ppm 缩放
-  const group = document.createElementNS(NS, 'g')
-  group.setAttribute(
-    'transform',
-    `translate(${-opts.bbox.x * ppm} ${-opts.bbox.y * ppm}) scale(${ppm})`
-  )
-
-  // 逐图元深拷贝（已包含全部世界坐标几何）
-  const maskNode = worldContent.querySelector('#wall-openings-mask')
-  if (maskNode) {
-    const defs = document.createElementNS(NS, 'defs')
-    const clonedMask = maskNode.cloneNode(true)
-    defs.appendChild(clonedMask)
-    outSvg.appendChild(defs)
-  }
-  worldContent.querySelectorAll(EXPORT_SELECTOR).forEach((node) => {
-    const clone = node.cloneNode(true) as Element
-    // 移除选中态装饰（虚线中心线、手柄、旋转/缩放把手、选中框）
-    clone
-      .querySelectorAll('[data-selected-ui]')
-      .forEach((ui) => ui.parentNode?.removeChild(ui))
-    group.appendChild(clone)
+/** 等待两帧，确保离屏 SVG 完成渲染 */
+function waitFrames(n = 2): Promise<void> {
+  return new Promise((resolve) => {
+    let i = 0
+    const tick = () => (++i >= n ? resolve() : requestAnimationFrame(tick))
+    requestAnimationFrame(tick)
   })
-  outSvg.appendChild(group)
+}
 
-  const xml = new XMLSerializer().serializeToString(outSvg)
-  const svgText = `<?xml version="1.0" encoding="UTF-8"?>\n${xml}`
-  const img = await svgStringToImage(svgText)
+/** 动态挂载离屏导出渲染器，返回根元素与卸载函数 */
+function mountExportRenderer(): { host: HTMLElement; unmount: () => void } {
+  const host = document.createElement('div')
+  host.style.position = 'fixed'
+  host.style.left = '-100000px'
+  host.style.top = '0'
+  host.style.width = '10px'
+  host.style.height = '10px'
+  host.style.overflow = 'hidden'
+  host.style.pointerEvents = 'none'
+  document.body.appendChild(host)
+  const app = createApp({ render: () => h(ExportRenderer) })
+  app.mount(host)
+  return { host, unmount: () => { app.unmount(); host.remove() } }
+}
 
-  const canvas = document.createElement('canvas')
-  canvas.width = Math.round(wPx * ratio)
-  canvas.height = Math.round(hPx * ratio)
-  const ctx = canvas.getContext('2d')
-  if (!ctx) throw new Error('无法创建 Canvas 上下文')
-  ctx.fillStyle = opts.background ?? '#ffffff'
-  ctx.fillRect(0, 0, canvas.width, canvas.height)
-  ctx.scale(ratio, ratio)
-  ctx.drawImage(img, 0, 0, wPx, hPx)
+export async function exportPng(_liveSvg: SVGSVGElement, opts: ExportOptions): Promise<void> {
+  const ratio = opts.pixelRatio ?? 2
+  const ppm = EXPORT_SCALE
+  const maxSide = opts.maxPixels ?? 6000
+  const baseW = Math.round(opts.bbox.width * ppm)
+  const baseH = Math.round(opts.bbox.height * ppm)
+  const scaleDown = Math.min(1, maxSide / Math.max(baseW, baseH))
+  const usePpm = ppm * scaleDown
 
-  const url = canvas.toDataURL('image/png')
-  triggerDownload(url, `floorplan_${Date.now()}.png`)
+  // 挂载离屏渲染器并等待渲染
+  const { unmount } = mountExportRenderer()
+  try {
+    await nextTick()
+    await waitFrames(2)
+
+    // 从离屏 DOM 中取出 world-content（固定 EXPORT_SCALE，无选中态/网格）
+    const off = document.querySelector('.export-svg') as SVGSVGElement | null
+    const srcContent = off?.querySelector('.world-content') as SVGGElement | null
+    if (!srcContent) throw new Error('导出渲染未就绪')
+
+    const NS = 'http://www.w3.org/2000/svg'
+    const outW = Math.round(opts.bbox.width * usePpm)
+    const outH = Math.round(opts.bbox.height * usePpm)
+    const outSvg = document.createElementNS(NS, 'svg')
+    outSvg.setAttribute('xmlns', NS)
+    outSvg.setAttribute('width', String(outW))
+    outSvg.setAttribute('height', String(outH))
+    outSvg.setAttribute('viewBox', `0 0 ${outW} ${outH}`)
+
+    const bg = document.createElementNS(NS, 'rect')
+    bg.setAttribute('x', '0')
+    bg.setAttribute('y', '0')
+    bg.setAttribute('width', String(outW))
+    bg.setAttribute('height', String(outH))
+    bg.setAttribute('fill', opts.background ?? '#ffffff')
+    outSvg.appendChild(bg)
+
+    // 复制 mask 定义
+    const maskNode = srcContent.querySelector('#wall-openings-mask')
+    if (maskNode) {
+      const defs = document.createElementNS(NS, 'defs')
+      defs.appendChild(maskNode.cloneNode(true))
+      outSvg.appendChild(defs)
+    }
+
+    // 世界 -> 输出像素。离屏内容自身已含 scale(EXPORT_SCALE)，
+    // 外层只需把 bbox 左上移到原点并按 usePpm/EXPORT_SCALE 补偿到目标比例，
+    // 避免双重缩放。
+    const k = usePpm / EXPORT_SCALE
+    const group = document.createElementNS(NS, 'g')
+    group.setAttribute(
+      'transform',
+      `translate(${-opts.bbox.x * usePpm} ${-opts.bbox.y * usePpm}) scale(${k})`
+    )
+    const clone = srcContent.cloneNode(true) as SVGGElement
+    clone.querySelectorAll('[data-selected-ui]').forEach((n) => n.parentNode?.removeChild(n))
+    group.appendChild(clone)
+    outSvg.appendChild(group)
+
+    const xml = new XMLSerializer().serializeToString(outSvg)
+    const svgText = `<?xml version="1.0" encoding="UTF-8"?>\n${xml}`
+    const img = await svgStringToImage(svgText)
+
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.round(outW * ratio)
+    canvas.height = Math.round(outH * ratio)
+    const ctx = canvas.getContext('2d')
+    if (!ctx) throw new Error('无法创建 Canvas 上下文')
+    ctx.fillStyle = opts.background ?? '#ffffff'
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    ctx.scale(ratio, ratio)
+    ctx.drawImage(img, 0, 0, outW, outH)
+
+    const url = canvas.toDataURL('image/png')
+    triggerDownload(url, `floorplan_${Date.now()}.png`)
+  } finally {
+    unmount()
+  }
 }
 
 function svgStringToImage(svg: string): Promise<HTMLImageElement> {

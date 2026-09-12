@@ -89,6 +89,7 @@ function pushHistory() {
   undoStack.push(cloneDoc(state.doc))
   if (undoStack.length > HISTORY_LIMIT) undoStack.shift()
   redoStack.length = 0
+  refreshHistoryFlags()
 }
 
 const canUndo = shallowRef(false)

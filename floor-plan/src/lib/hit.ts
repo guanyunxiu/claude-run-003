@@ -16,32 +16,15 @@ export interface HitResult {
 }
 
 function hitFurniture(f: FurnitureElement, p: Pt): boolean {
-  // 包围盒（轴对齐，用四角旋转后再判点；简单起见旋转后用多边形判定）
-  const cos = Math.cos(-f.rotation)
-  const sin = Math.sin(-f.rotation)
-  const corners = [
-    { x: -f.width / 2, y: -f.height / 2 },
-    { x: f.width / 2, y: -f.height / 2 },
-    { x: f.width / 2, y: f.height / 2 },
-    { x: -f.width / 2, y: f.height / 2 }
-  ].map((c) => ({
-    x: c.x * cos - c.y * sin + f.x,
-    y: c.x * sin + c.y * cos + f.y
-  }))
-  return pointInPolygonLocal(p, corners)
-}
-
-function pointInPolygonLocal(p: Pt, poly: Pt[]): boolean {
-  let inside = false
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const xi = poly[i].x
-    const yi = poly[i].y
-    const xj = poly[j].x
-    const yj = poly[j].y
-    const hit = yi > p.y !== yj > p.y && p.x < ((xj - xi) * (p.y - yi)) / (yj - yi) + xi
-    if (hit) inside = !inside
-  }
-  return inside
+  // 将世界点反旋转（-rotation）到家具局部坐标系，再做轴对齐矩形判定。
+  // 渲染时世界 = 局部绕中心旋转 +rotation，这里方向必须与之相反。
+  const dx = p.x - f.x
+  const dy = p.y - f.y
+  const c = Math.cos(-f.rotation)
+  const s = Math.sin(-f.rotation)
+  const lx = dx * c - dy * s
+  const ly = dx * s + dy * c
+  return Math.abs(lx) <= f.width / 2 && Math.abs(ly) <= f.height / 2
 }
 
 function hitDimension(d: DimensionElement, p: Pt, tolMm: number): HitResult | null {
